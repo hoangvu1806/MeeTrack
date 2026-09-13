@@ -1,6 +1,8 @@
 mod meeting_core;
+mod speaker_identity;
 
 use meeting_core::CoreManager;
+use speaker_identity::IdentityStoreLock;
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -8,9 +10,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(CoreManager::default())
+        .manage(IdentityStoreLock::default())
         .invoke_handler(tauri::generate_handler![
             meeting_core::core_status,
             meeting_core::list_audio_devices,
+            meeting_core::list_capture_sources,
             meeting_core::start_recording,
             meeting_core::set_recording_paused,
             meeting_core::stop_recording,
@@ -20,6 +24,9 @@ pub fn run() {
             meeting_core::start_voice_enrollment,
             meeting_core::stop_voice_enrollment,
             meeting_core::upload_voice_sample,
+            speaker_identity::assign_speaker_identity,
+            speaker_identity::list_meeting_transcripts,
+            speaker_identity::load_meeting_transcript,
         ])
         .setup(|app| {
             if let Ok(resources) = app.path().resource_dir() {

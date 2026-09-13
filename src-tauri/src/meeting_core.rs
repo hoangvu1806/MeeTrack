@@ -1,4 +1,5 @@
 use meeting_core_rust::{
+    capture::{self, CaptureCatalog, CaptureSpec},
     initialize_runtime,
     pipeline::{self, Config, PipelineControl, Source},
     run_id, Record,
@@ -44,16 +45,36 @@ pub struct AudioDevice {
     label: String,
 }
 
+#[derive(Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureSelection {
+    #[serde(default)]
+    microphone_device: Option<String>,
+    #[serde(default)]
+    system_audio: bool,
+    #[serde(default)]
+    output_device: Option<String>,
+    #[serde(default)]
+    applications: Vec<SelectedApplication>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SelectedApplication {
+    process_id: u32,
+    label: String,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Person {
-    id: String,
-    name: String,
-    role: String,
-    location: String,
-    voice_ready: bool,
-    sample_seconds: f32,
-    updated_at: u64,
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) role: String,
+    pub(crate) location: String,
+    pub(crate) voice_ready: bool,
+    pub(crate) sample_seconds: f32,
+    pub(crate) updated_at: u64,
 }
 
 #[derive(Deserialize)]
@@ -125,10 +146,22 @@ pub fn list_audio_devices() -> Result<Vec<AudioDevice>, String> {
 }
 
 #[tauri::command]
+pub fn list_capture_sources() -> Result<CaptureCatalog, String> {
+    std::thread::Builder::new()
+        .name("audio-source-catalog".to_owned())
+        .spawn(capture::list_capture_catalog)
+        .map_err(|error| format!("Không thể tạo luồng dò nguồn âm thanh: {error}"))?
+        .join()
+        .map_err(|_| "Luồng dò nguồn âm thanh đã dừng bất thường".to_owned())?
+        .map_err(|error| format!("Không thể đọc nguồn âm thanh: {error:#}"))
+}
+
+#[tauri::command]
 pub fn start_recording(
     app: AppHandle,
     manager: State<'_, CoreManager>,
     device: Option<String>,
+    selection: Option<CaptureSelection>,
     profiles_path: Option<String>,
     stt_api: Option<bool>,
 ) -> Result<CoreStatus, String> {
@@ -141,17 +174,22 @@ pub fn start_recording(
         }
     }
 
-    let selected_device = match device {
-        Some(device) => device,
-        None => list_audio_devices()?.remove(0).id,
+    let catalog = list_capture_sources()?;
+    let specs = resolve_capture_specs(&catalog, selection, device)?;
+    let selected_device = specs
+        .iter()
+        .map(|spec| spec.origin().label)
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let profiles = match resolve_profiles_path(&app, profiles_path) {
+        Some(profiles_path) => pipeline::load_profiles(&profiles_path).map_err(|error| {
+            format!(
+                "Không thể đọc hồ sơ giọng nói {}: {error:#}",
+                profiles_path.display()
+            )
+        })?,
+        None => std::collections::HashMap::new(),
     };
-    let profiles_path = resolve_profiles_path(&app, profiles_path)?;
-    let profiles = pipeline::load_profiles(&profiles_path).map_err(|error| {
-        format!(
-            "Không thể đọc hồ sơ giọng nói {}: {error:#}",
-            profiles_path.display()
-        )
-    })?;
     let output = app
         .path()
         .app_data_dir()
@@ -160,11 +198,11 @@ pub fn start_recording(
         .join(run_id());
     let control = PipelineControl::new();
     let config = Config {
-        source: Source::Microphone(selected_device.clone()),
+        source: Source::Live(specs),
         profiles,
         output: output.clone(),
         speed: 1.0,
-        stt_api: stt_api.unwrap_or(false),
+        stt_api: stt_api.unwrap_or(true),
         ground_truth: None,
     };
 
@@ -173,7 +211,7 @@ pub fn start_recording(
         session.active = true;
         session.paused = false;
         session.device = Some(selected_device);
-        session.output = Some(output);
+        session.output = Some(output.clone());
         session.error = None;
         session.control = Some(control.clone());
         session.status()
@@ -181,22 +219,43 @@ pub fn start_recording(
 
     let (event_tx, event_rx) = std::sync::mpsc::channel::<Record>();
     let event_app = app.clone();
-    std::thread::spawn(move || {
-        for record in event_rx {
-            let _ = event_app.emit("meeting://record", record);
-        }
-    });
+    let identity_output = output.clone();
+    let identity_worker = std::thread::Builder::new()
+        .name("meeting-identity".to_owned())
+        .spawn(move || -> Result<(), String> {
+            let mut identity_resolver =
+                crate::speaker_identity::IdentityResolver::load(&event_app, identity_output)?;
+            for record in event_rx {
+                match identity_resolver.resolve(record) {
+                    Ok(record) => {
+                        let _ = event_app.emit("meeting://record", record);
+                    }
+                    Err(error) => {
+                        let _ = event_app.emit("meeting://identity-error", error);
+                    }
+                }
+            }
+            Ok(())
+        })
+        .map_err(|error| error.to_string())?;
 
     let done_app = app.clone();
     let done_manager = manager.clone();
     std::thread::spawn(move || {
         let result = pipeline::run_controlled(config, control, Some(event_tx));
+        let identity_result = identity_worker
+            .join()
+            .map_err(|_| "identity worker panicked".to_owned())
+            .and_then(|result| result);
         let status = match lock(&done_manager) {
             Ok(mut session) => {
                 session.active = false;
                 session.paused = false;
                 session.control = None;
-                session.error = result.err().map(|error| format!("{error:#}"));
+                session.error = result
+                    .err()
+                    .map(|error| format!("{error:#}"))
+                    .or_else(|| identity_result.err());
                 session.status()
             }
             Err(error) => CoreStatus {
@@ -286,6 +345,7 @@ pub fn save_person(app: AppHandle, person: PersonInput) -> Result<Person, String
     };
     save_people(&app, &people)?;
     rebuild_profiles(&app, &people)?;
+    crate::speaker_identity::notify_person_updated(&app, &saved.id, &saved.name)?;
     Ok(saved)
 }
 
@@ -296,7 +356,8 @@ pub fn delete_person(app: AppHandle, id: String) -> Result<(), String> {
     let audio = people_root(&app)?.join("audio").join(format!("{id}.wav"));
     let _ = std::fs::remove_file(audio);
     save_people(&app, &people)?;
-    rebuild_profiles(&app, &people)
+    rebuild_profiles(&app, &people)?;
+    crate::speaker_identity::detach_person(&app, &id)
 }
 
 #[tauri::command]
@@ -405,8 +466,8 @@ pub fn upload_voice_sample(
     mark_voice_ready(&app, &person_id, seconds)
 }
 
-fn resolve_profiles_path(app: &AppHandle, explicit: Option<String>) -> Result<PathBuf, String> {
-    let local = people_root(app)?.join("profiles.json");
+fn resolve_profiles_path(app: &AppHandle, explicit: Option<String>) -> Option<PathBuf> {
+    let local = people_root(app).ok()?.join("profiles.json");
     let candidates = [
         explicit.map(PathBuf::from),
         std::env::var_os("MEETING_PROFILES_PATH").map(PathBuf::from),
@@ -420,10 +481,116 @@ fn resolve_profiles_path(app: &AppHandle, explicit: Option<String>) -> Result<Pa
         .into_iter()
         .flatten()
         .find(|path| profile_file_has_entries(path))
-        .ok_or_else(|| {
-            "Không tìm thấy profiles.json; đặt biến MEETING_PROFILES_PATH hoặc truyền profilesPath"
-                .to_owned()
-        })
+}
+
+fn resolve_capture_specs(
+    catalog: &CaptureCatalog,
+    selection: Option<CaptureSelection>,
+    legacy_device: Option<String>,
+) -> Result<Vec<CaptureSpec>, String> {
+    if let Some(device) = legacy_device {
+        return Ok(vec![CaptureSpec::Microphone {
+            device_id: Some(device.clone()),
+            legacy_name: Some(device.clone()),
+            label: catalog
+                .microphones
+                .iter()
+                .find(|item| item.id == device)
+                .map(|item| item.label.clone())
+                .unwrap_or(device),
+        }]);
+    }
+
+    let selection = selection.unwrap_or_else(|| CaptureSelection {
+        microphone_device: catalog
+            .microphones
+            .iter()
+            .find(|device| device.is_default)
+            .or_else(|| catalog.microphones.first())
+            .map(|device| device.id.clone()),
+        ..CaptureSelection::default()
+    });
+    if selection.system_audio && !selection.applications.is_empty() {
+        return Err(
+            "Hãy chọn âm thanh toàn hệ thống hoặc ứng dụng riêng, không chọn đồng thời".to_owned(),
+        );
+    }
+
+    let mut specs = Vec::new();
+    if let Some(id) = selection.microphone_device {
+        let device = catalog
+            .microphones
+            .iter()
+            .find(|device| device.id == id)
+            .or_else(|| catalog.microphones.iter().find(|device| device.is_default))
+            .or_else(|| catalog.microphones.first())
+            .ok_or("Không tìm thấy micrô khả dụng")?;
+        specs.push(CaptureSpec::Microphone {
+            device_id: Some(device.id.clone()),
+            label: device.label.clone(),
+            legacy_name: directshow_microphone_for(&device.label),
+        });
+    }
+    if selection.system_audio {
+        let device = catalog
+            .outputs
+            .iter()
+            .find(|device| device.is_default)
+            .or_else(|| {
+                selection
+                    .output_device
+                    .as_deref()
+                    .and_then(|id| catalog.outputs.iter().find(|device| device.id == id))
+            })
+            .or_else(|| catalog.outputs.first())
+            .ok_or("Không tìm thấy thiết bị phát âm thanh")?;
+        specs.push(CaptureSpec::System {
+            device_id: Some(device.id.clone()),
+            label: format!("Âm thanh hệ thống · {}", device.label),
+        });
+    }
+    for selected in selection.applications {
+        if !catalog.application_capture_supported {
+            return Err("Windows hiện tại không hỗ trợ thu âm theo ứng dụng".to_owned());
+        }
+        let application = catalog
+            .applications
+            .iter()
+            .find(|application| application.process_id == selected.process_id)
+            .or_else(|| {
+                catalog
+                    .applications
+                    .iter()
+                    .find(|application| application.label.eq_ignore_ascii_case(&selected.label))
+            })
+            .ok_or_else(|| format!("{} hiện không phát âm thanh", selected.label))?;
+        specs.push(CaptureSpec::Application {
+            process_id: application.process_id,
+            label: application.label.clone(),
+        });
+    }
+    if specs.is_empty() {
+        return Err("Hãy chọn ít nhất một nguồn âm thanh".to_owned());
+    }
+    Ok(specs)
+}
+
+fn directshow_microphone_for(label: &str) -> Option<String> {
+    let target = comparable_audio_name(label);
+    list_audio_devices().ok()?.into_iter().find_map(|device| {
+        let candidate = comparable_audio_name(&device.label);
+        (candidate == target
+            || (!target.is_empty() && (candidate.contains(&target) || target.contains(&candidate))))
+        .then_some(device.id)
+    })
+}
+
+fn comparable_audio_name(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|character| character.is_alphanumeric())
+        .collect()
 }
 
 fn profile_file_has_entries(path: &Path) -> bool {
@@ -435,7 +602,7 @@ fn profile_file_has_entries(path: &Path) -> bool {
         .is_some_and(|profiles| !profiles.is_empty())
 }
 
-fn people_root(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn people_root(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app
         .path()
         .app_data_dir()
@@ -443,7 +610,7 @@ fn people_root(app: &AppHandle) -> Result<PathBuf, String> {
         .join("voice_profiles"))
 }
 
-fn load_people(app: &AppHandle) -> Result<Vec<Person>, String> {
+pub(crate) fn load_people(app: &AppHandle) -> Result<Vec<Person>, String> {
     let path = people_root(app)?.join("people.json");
     if !path.is_file() {
         return Ok(Vec::new());
@@ -482,7 +649,7 @@ fn rebuild_profiles(app: &AppHandle, people: &[Person]) -> Result<(), String> {
     .map_err(|error| error.to_string())
 }
 
-fn mark_voice_ready(app: &AppHandle, id: &str, seconds: f32) -> Result<Person, String> {
+pub(crate) fn mark_voice_ready(app: &AppHandle, id: &str, seconds: f32) -> Result<Person, String> {
     let mut people = load_people(app)?;
     let person = people
         .iter_mut()
@@ -497,7 +664,26 @@ fn mark_voice_ready(app: &AppHandle, id: &str, seconds: f32) -> Result<Person, S
     Ok(result)
 }
 
-fn unix_time() -> u64 {
+pub(crate) fn mark_identity_voice_ready(
+    app: &AppHandle,
+    id: &str,
+    seconds: f32,
+) -> Result<Person, String> {
+    let mut people = load_people(app)?;
+    let person = people
+        .iter_mut()
+        .find(|person| person.id == id)
+        .ok_or("Không tìm thấy hồ sơ")?;
+    person.voice_ready = seconds >= 1.0;
+    person.sample_seconds = seconds;
+    person.updated_at = unix_time();
+    let result = person.clone();
+    save_people(app, &people)?;
+    rebuild_profiles(app, &people)?;
+    Ok(result)
+}
+
+pub(crate) fn unix_time() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

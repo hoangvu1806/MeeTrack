@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import {
   AlertTriangle, ArrowUpRight, AudioLines, Bell, BookOpen, BookOpenCheck, BrainCircuit, Briefcase,
   CalendarCheck, CalendarDays, Check, ChevronDown, ChevronRight, CircleCheck,
@@ -8,15 +8,16 @@ import {
   Languages, LayoutDashboard, ListFilter, MapPin, Mic, Moon, PanelLeftClose, Pencil, PenLine,
   PanelLeftOpen, PanelsTopLeft, Pause, Play, Radio, Search, Settings,
   ShieldCheck, ShieldAlert, SlidersHorizontal, Sparkles, Square, Sun, Trash2, Upload, User,
-  UserPlus, UserRoundCheck, UserRoundPlus,
+  UserPlus, UserRoundCheck, UserRoundPlus, WandSparkles,
   Users, Volume2, X,
 } from "lucide";
 import { dictionaries, languages, type Locale, type TranslationKey } from "@/lib/i18n";
-import { deletePerson, isTauri, listPeople, pauseCoreRecording, pickVoiceFile, savePerson, startCoreRecording, startVoiceEnrollment, stopCoreRecording, stopVoiceEnrollment, subscribeToMeetingCore, subscribeToVoiceEnrollment, uploadVoiceSample, type Person, type SpeechResult } from "@/lib/meeting-core";
+import { assignSpeakerIdentity, deletePerson, isTauri, listMeetingTranscripts, listPeople, loadMeetingTranscript, pauseCoreRecording, pickVoiceFile, savePerson, startCoreRecording, startVoiceEnrollment, stopCoreRecording, stopVoiceEnrollment, subscribeToIdentityUpdates, subscribeToMeetingCore, subscribeToVoiceEnrollment, uploadVoiceSample, type CaptureSelection, type IdentityUpdate, type MeetingSummary, type Person, type SpeechResult } from "@/lib/meeting-core";
 import { useAudioSignal } from "@/lib/use-audio-signal";
 import LavaLamp from "./origin/lava-lamp";
 import { UiIcon } from "./ui-icon";
 import { WindowTitlebar } from "./window-titlebar";
+import { AudioSourcePicker } from "./audio-source-picker";
 
 type Tab = "overview" | "meetings" | "people" | "knowledge" | "settings";
 type Theme = "light" | "dark" | "system";
@@ -40,6 +41,18 @@ function formatTime(seconds: number) {
   return `${minutes}:${(seconds % 60).toString().padStart(2, "0")}`;
 }
 
+function appendUniqueTranscript(current: SpeechResult[], incoming: SpeechResult[]) {
+  const seen = new Set(current.map((item) => `${item.part}:${item.start}:${item.end}:${item.speakerId}:${item.text}`));
+  const next = [...current];
+  for (const item of incoming) {
+    const key = `${item.part}:${item.start}:${item.end}:${item.speakerId}:${item.text}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    next.push(item);
+  }
+  return next;
+}
+
 function Toggle({ checked, onChange, label }: { checked: boolean; onChange: () => void; label: string }) {
   return (
     <button className={`switch${checked ? " is-on" : ""}`} type="button" role="switch" aria-checked={checked} aria-label={label} onClick={onChange}>
@@ -61,6 +74,9 @@ export function AppShell() {
   const [autoConfirm, setAutoConfirm] = useState(true);
   const [backgroundProcessing, setBackgroundProcessing] = useState(true);
   const [notifications, setNotifications] = useState(true);
+  const [captureSelection, setCaptureSelection] = useState<CaptureSelection | null>(null);
+  const [activeSources, setActiveSources] = useState<string[]>([]);
+  const identityAliases = useRef(new Map<string, IdentityUpdate>());
 
   // Lifted from PeopleView so AppShell can guard tab switches
   const [voiceEnrolling, setVoiceEnrolling] = useState(false);
@@ -103,9 +119,13 @@ export function AppShell() {
   useEffect(() => {
     const storedLocale = localStorage.getItem("meetrack-locale") as Locale | null;
     const storedTheme = localStorage.getItem("meetrack-theme") as Theme | null;
+    const storedCapture = localStorage.getItem("meetrack-capture-selection");
+    const storedCaptureLabels = localStorage.getItem("meetrack-capture-labels");
     queueMicrotask(() => {
       if (storedLocale && languages.some((item) => item.code === storedLocale)) setLocale(storedLocale);
       if (storedTheme && ["light", "dark", "system"].includes(storedTheme)) setTheme(storedTheme);
+      if (storedCapture) { try { setCaptureSelection(JSON.parse(storedCapture) as CaptureSelection); } catch {} }
+      if (storedCaptureLabels) { try { setActiveSources(JSON.parse(storedCaptureLabels) as string[]); } catch {} }
     });
   }, []);
 
@@ -135,37 +155,64 @@ export function AppShell() {
 
   useEffect(() => {
     let dispose: () => void = () => undefined;
-    subscribeToMeetingCore(
+    let cancelled = false;
+    void subscribeToMeetingCore(
       (record) => {
-        const results = record.processed?.results ?? [];
-        if (results.length) setTranscript((current) => [...current, ...results]);
+        const results = (record.results ?? []).map((item) => {
+          const alias = identityAliases.current.get(item.speakerId);
+          return alias ? { ...item, speaker: alias.displayName, personId: alias.personId } : item;
+        });
+        if (results.length) setTranscript((current) => appendUniqueTranscript(current, results));
       },
       (status) => {
         setPaused(status.paused);
         if (status.error) setCoreError(status.error);
-        if (!status.active) setRecording(false);
+        if (!status.active) { setRecording(false); setActiveTab("meetings"); }
       },
-    ).then((unlisten) => { dispose = unlisten; });
-    return () => dispose();
+      (update) => {
+        identityAliases.current.set(update.speakerId, update);
+        setTranscript((current) => applyIdentityUpdate(current, update));
+      },
+    ).then((unlisten) => {
+      if (cancelled) unlisten();
+      else dispose = unlisten;
+    });
+    return () => {
+      cancelled = true;
+      dispose();
+    };
   }, []);
 
-  const beginRecording = async () => {
+  const beginRecording = async (selection: CaptureSelection | null, labels: string[]) => {
+    setActiveSources(labels);
     setCoreError(null);
     setTranscript([]);
     setElapsed(0);
-    if (!isTauri()) { setRecording(true); return; }
+    setRecording(true);
+    if (!isTauri()) return;
     try {
-      await startCoreRecording();
-      setRecording(true);
+      await startCoreRecording(selection);
     } catch (error) {
       setCoreError(String(error));
-      setRecording(true);
+      setRecording(false);
     }
+  };
+
+  const requestRecording = () => {
+    void beginRecording(captureSelection, activeSources.length ? activeSources : [t("microphone")]);
+  };
+
+  const saveCaptureSelection = (selection: CaptureSelection, labels: string[]) => {
+    setCaptureSelection(selection);
+    setActiveSources(labels);
+    localStorage.setItem("meetrack-capture-selection", JSON.stringify(selection));
+    localStorage.setItem("meetrack-capture-labels", JSON.stringify(labels));
   };
 
   const stopRecording = async () => {
     if (isTauri()) {
-      try { await stopCoreRecording(); } catch (error) { setCoreError(String(error)); }
+      try { await stopCoreRecording(); setPaused(true); } catch (error) { setCoreError(String(error)); }
+      return;
     }
     setRecording(false);
     setPaused(false);
@@ -228,19 +275,21 @@ export function AppShell() {
             <div className="toolbar-actions">
               <label className="search-box"><UiIcon icon={Search} size={16} /><input aria-label={t("search")} placeholder={t("search")} /></label>
               <button className="icon-button" type="button" aria-label="Notifications"><UiIcon icon={Bell} hoverIcon={Radio} size={17} /></button>
-              <button className="record-button" type="button" onClick={beginRecording}><span><UiIcon icon={Mic} hoverIcon={AudioLines} size={16} strokeWidth={2} /></span>{t("newMeeting")}</button>
+              <button className="record-button" type="button" onClick={requestRecording}><span><UiIcon icon={Mic} hoverIcon={AudioLines} size={16} strokeWidth={2} /></span>{t("newMeeting")}</button>
             </div>
           </header>
 
           <div className="view-stage">
             {recording ? (
-              <RecordingView t={t} elapsed={elapsed} paused={paused} togglePaused={togglePaused} stop={stopRecording} transcript={transcript} coreError={coreError} />
+              <RecordingView t={t} locale={locale} elapsed={elapsed} paused={paused} togglePaused={togglePaused} stop={stopRecording} transcript={transcript} setTranscript={setTranscript} coreError={coreError} sources={activeSources} />
             ) : activeTab === "overview" ? (
-              <OverviewView t={t} start={beginRecording} />
+              <OverviewView t={t} start={requestRecording} />
             ) : activeTab === "people" ? (
               <PeopleView locale={locale} onEnrollingChange={setVoiceEnrolling} />
+            ) : activeTab === "meetings" ? (
+              <MeetingsView locale={locale} />
             ) : activeTab === "settings" ? (
-              <SettingsView t={t} locale={locale} setLocale={setLocale} theme={theme} setTheme={setTheme} autoConfirm={autoConfirm} setAutoConfirm={setAutoConfirm} backgroundProcessing={backgroundProcessing} setBackgroundProcessing={setBackgroundProcessing} notifications={notifications} setNotifications={setNotifications} />
+              <SettingsView t={t} locale={locale} setLocale={setLocale} theme={theme} setTheme={setTheme} autoConfirm={autoConfirm} setAutoConfirm={setAutoConfirm} backgroundProcessing={backgroundProcessing} setBackgroundProcessing={setBackgroundProcessing} notifications={notifications} setNotifications={setNotifications} captureSelection={captureSelection} saveCaptureSelection={saveCaptureSelection} />
             ) : (
               <CollectionView tab={activeTab} t={t} />
             )}
@@ -251,10 +300,10 @@ export function AppShell() {
       {/* Tab switch warning modal */}
       {pendingTab ? (
         <div className="tab-warning-overlay" onClick={cancelTabSwitch}>
-          <div className="tab-warning-modal glass-card" onClick={(e) => e.stopPropagation()}>
+          <div className="tab-warning-modal" role="alertdialog" aria-modal="true" aria-labelledby="tab-warning-title" aria-describedby="tab-warning-description" onClick={(e) => e.stopPropagation()}>
             <span className="tab-warning-icon"><UiIcon icon={AlertTriangle} size={22} strokeWidth={1.8} /></span>
-            <strong>{warnCopy.title}</strong>
-            <p>{warnCopy.body}</p>
+            <strong id="tab-warning-title">{warnCopy.title}</strong>
+            <p id="tab-warning-description">{warnCopy.body}</p>
             <div className="tab-warning-actions">
               <button type="button" className="tab-warning-stay" onClick={cancelTabSwitch}><UiIcon icon={Mic} hoverIcon={AudioLines} size={14} />{warnCopy.stay}</button>
               <button type="button" className="tab-warning-leave" onClick={() => void confirmTabSwitch()}><UiIcon icon={Square} size={12} strokeWidth={2.4} />{warnCopy.leave}</button>
@@ -302,7 +351,56 @@ function Metric({ icon, value, label, note }: { icon: typeof Clock3; value: stri
   return <article className="metric-card glass-card"><span className="metric-icon"><UiIcon icon={icon} size={17} /></span><div><small>{label}</small><strong>{value}</strong><p>{note}</p></div><UiIcon icon={ChevronRight} size={15} className="metric-chevron" /></article>;
 }
 
-function RecordingView({ t, elapsed, paused, togglePaused, stop, transcript, coreError }: { t: (key: TranslationKey) => string; elapsed: number; paused: boolean; togglePaused: () => void; stop: () => void; transcript: SpeechResult[]; coreError: string | null }) {
+function applyIdentityUpdate(items: SpeechResult[], update: IdentityUpdate) {
+  return items.map((item) => item.speakerId === update.speakerId ? { ...item, speaker: update.displayName, personId: update.personId } : item);
+}
+
+const identityCopy = {
+  vi: { assign: "Đặt tên người nói", hint: "Tên này sẽ áp dụng cho mọi đoạn có cùng giọng.", existing: "Chọn hồ sơ", create: "Tạo hồ sơ mới", name: "Tên người nói", save: "Tạo và gán", cancel: "Đóng", unknown: "Chưa định danh", meetings: "Cuộc họp đã ghi", empty: "Chưa có cuộc họp được xử lý", utterances: "đoạn", speakers: "người nói", select: "Chọn một cuộc họp để xem transcript" },
+  en: { assign: "Name this speaker", hint: "The name applies to every segment with the same voice.", existing: "Choose profile", create: "Create new profile", name: "Speaker name", save: "Create and assign", cancel: "Close", unknown: "Unidentified", meetings: "Recorded meetings", empty: "No processed meetings yet", utterances: "segments", speakers: "speakers", select: "Choose a meeting to review its transcript" },
+  zh: { assign: "命名说话人", hint: "该名称将应用于所有相同声音的片段。", existing: "选择档案", create: "新建档案", name: "说话人姓名", save: "创建并分配", cancel: "关闭", unknown: "未识别", meetings: "已录会议", empty: "暂无已处理会议", utterances: "段", speakers: "位说话人", select: "选择会议查看转写" },
+  ja: { assign: "話者に名前を付ける", hint: "同じ声のすべての区間に適用されます。", existing: "プロフィールを選択", create: "新規プロフィール", name: "話者名", save: "作成して割り当て", cancel: "閉じる", unknown: "未識別", meetings: "録音済み会議", empty: "処理済み会議はありません", utterances: "区間", speakers: "話者", select: "会議を選択して文字起こしを確認" },
+  ko: { assign: "화자 이름 지정", hint: "같은 음성의 모든 구간에 적용됩니다.", existing: "프로필 선택", create: "새 프로필", name: "화자 이름", save: "생성 및 지정", cancel: "닫기", unknown: "미식별", meetings: "녹음된 회의", empty: "처리된 회의 없음", utterances: "구간", speakers: "화자", select: "회의를 선택해 전사를 확인하세요" },
+} as const;
+
+function TranscriptList({ items, locale, onChange }: { items: SpeechResult[]; locale: Locale; onChange: (update: IdentityUpdate) => void }) {
+  const copy = identityCopy[locale];
+  const [target, setTarget] = useState<SpeechResult | null>(null);
+  const [people, setPeople] = useState<Person[]>([]);
+  const [newName, setNewName] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!target || !isTauri()) return;
+    listPeople().then(setPeople).catch((reason) => setError(String(reason)));
+  }, [target]);
+  const assign = async (personId: string) => {
+    if (!target) return;
+    try { onChange(await assignSpeakerIdentity(target.speakerId, personId)); setTarget(null); } catch (reason) { setError(String(reason)); }
+  };
+  const createAndAssign = async () => {
+    if (!target || !newName.trim()) return;
+    try {
+      const person = await savePerson({ name: newName.trim(), role: "", location: "" });
+      onChange(await assignSpeakerIdentity(target.speakerId, person.id)); setTarget(null); setNewName("");
+    } catch (reason) { setError(String(reason)); }
+  };
+  return <>
+    <div className="transcript-stream">{items.map((item, index) => <article className={item.kind === "overlap" ? "is-overlap" : ""} key={`${item.part}-${item.speakerId}-${index}`}>
+      <div><button className={`speaker-chip${item.personId ? " is-known" : ""}`} type="button" onClick={() => { setTarget(item); setError(null); }}><span>{item.speaker}</span>{!item.personId ? <UiIcon icon={WandSparkles} size={11} /> : null}</button>{item.origin?.label ? <span className={`transcript-origin transcript-origin--${item.origin.kind}`}>{item.origin.label}</span> : null}<time>{formatTime(Math.floor(item.start))}</time></div>
+      <button className="transcript-copy" type="button" onClick={() => { setTarget(item); setError(null); }}>{item.text || "…"}</button>
+    </article>)}</div>
+    {target ? <div className="identity-drawer">
+      <div className="identity-drawer-title"><div><strong>{copy.assign}</strong><small>{target.speakerId}</small></div><button type="button" aria-label={copy.cancel} onClick={() => setTarget(null)}><UiIcon icon={X} size={15} /></button></div>
+      <p>{copy.hint}</p>
+      {people.length ? <div className="identity-people"><span>{copy.existing}</span>{people.map((person) => <button type="button" key={person.id} onClick={() => void assign(person.id)}><span className="identity-avatar">{person.name.slice(0, 1).toUpperCase()}</span><span><strong>{person.name}</strong><small>{[person.role, person.location].filter(Boolean).join(" · ") || copy.unknown}</small></span><UiIcon icon={ChevronRight} size={13} /></button>)}</div> : null}
+      <div className="identity-create"><span>{copy.create}</span><div><input aria-label={copy.name} placeholder={copy.name} value={newName} onChange={(event) => setNewName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void createAndAssign(); }} /><button type="button" disabled={!newName.trim()} onClick={() => void createAndAssign()}>{copy.save}</button></div></div>
+      {error ? <small className="identity-error">{error}</small> : null}
+    </div> : null}
+  </>;
+}
+
+function RecordingView({ t, locale, elapsed, paused, togglePaused, stop, transcript, setTranscript, coreError, sources }: { t: (key: TranslationKey) => string; locale: Locale; elapsed: number; paused: boolean; togglePaused: () => void; stop: () => void; transcript: SpeechResult[]; setTranscript: Dispatch<SetStateAction<SpeechResult[]>>; coreError: string | null; sources: string[] }) {
   const audioSignal = useAudioSignal(paused);
 
   return (
@@ -327,6 +425,7 @@ function RecordingView({ t, elapsed, paused, togglePaused, stop, transcript, cor
           />
         </div>
         <time>{formatTime(elapsed)}</time><p>{paused ? t("pause") : t("listening")}</p><small>{t("recordingHint")}</small>
+        {sources.length ? <div className="recording-sources">{sources.map((source) => <span key={source}>{source}</span>)}</div> : null}
         <div className="recording-controls">
           <button className="round-control" type="button" aria-label={paused ? t("resume") : t("pause")} onClick={togglePaused}><UiIcon icon={paused ? Play : Pause} hoverIcon={paused ? Pause : Play} size={19} /></button>
           <button className="stop-control" type="button" onClick={stop}><span><UiIcon icon={Square} size={13} strokeWidth={2.4} /></span>{t("stopRecording")}</button>
@@ -334,19 +433,21 @@ function RecordingView({ t, elapsed, paused, togglePaused, stop, transcript, cor
       </div>
       <aside className="transcript-panel glass-card">
         <div className="panel-heading"><div><span className="panel-icon"><UiIcon icon={AudioLines} size={16} /></span><strong>{t("liveTranscript")}</strong></div><span className="processing-pill"><i />Live</span></div>
-        {coreError ? <div className="transcript-error">{coreError}</div> : transcript.length ? <div className="transcript-stream">{transcript.map((item, index) => <article className={item.kind === "overlap" ? "is-overlap" : ""} key={`${item.part}-${item.speaker}-${index}`}><div><strong>{item.speaker}</strong><time>{formatTime(Math.floor(item.start))}</time></div><p>{item.text || "…"}</p></article>)}</div> : <div className="transcript-empty"><span><UiIcon icon={Radio} size={24} /></span><strong>{t("noTranscript")}</strong><small>{t("speaker")} 1</small></div>}
+        {coreError ? <div className="transcript-error">{coreError}</div> : transcript.length ? <TranscriptList items={transcript} locale={locale} onChange={(update) => setTranscript((current) => applyIdentityUpdate(current, update))} /> : <div className="transcript-empty"><span><UiIcon icon={Radio} size={24} /></span><strong>{t("noTranscript")}</strong><small>{t("speaker")} 1</small></div>}
       </aside>
     </section>
   );
 }
 
-function SettingsView({ t, locale, setLocale, theme, setTheme, autoConfirm, setAutoConfirm, backgroundProcessing, setBackgroundProcessing, notifications, setNotifications }: {
+function SettingsView({ t, locale, setLocale, theme, setTheme, autoConfirm, setAutoConfirm, backgroundProcessing, setBackgroundProcessing, notifications, setNotifications, captureSelection, saveCaptureSelection }: {
   t: (key: TranslationKey) => string; locale: Locale; setLocale: (value: Locale) => void; theme: Theme; setTheme: (value: Theme) => void;
   autoConfirm: boolean; setAutoConfirm: (value: boolean) => void; backgroundProcessing: boolean; setBackgroundProcessing: (value: boolean) => void; notifications: boolean; setNotifications: (value: boolean) => void;
+  captureSelection: CaptureSelection | null; saveCaptureSelection: (selection: CaptureSelection, labels: string[]) => void;
 }) {
   const themes = [{ id: "light" as const, icon: Sun }, { id: "dark" as const, icon: Moon }, { id: "system" as const, icon: Cpu }];
   return (
     <div className="settings-view">
+      <AudioSourcePicker embedded locale={locale} initialSelection={captureSelection} onStart={saveCaptureSelection} />
       <section className="settings-card glass-card">
         <div className="settings-section-title"><span><UiIcon icon={Sparkles} size={17} /></span><div><h2>{t("appearance")}</h2><p>{t("appearanceHint")}</p></div></div>
         <div className="setting-row setting-row--themes"><div className="setting-label"><strong>{t("theme")}</strong></div><div className="theme-picker">{themes.map((item) => <button className={theme === item.id ? "is-selected" : ""} key={item.id} type="button" onClick={() => setTheme(item.id)}><span><UiIcon icon={item.icon} size={17} /></span><small>{t(item.id)}</small><i /></button>)}</div></div>
@@ -402,7 +503,8 @@ function PeopleView({ locale, onEnrollingChange }: { locale: Locale; onEnrolling
   useEffect(() => { refresh(); }, [refresh]);
   useEffect(() => {
     let dispose: () => void = () => undefined;
-    subscribeToVoiceEnrollment(
+    let cancelled = false;
+    void subscribeToVoiceEnrollment(
       (signal) => { setLevel(Math.min(1, signal.rms * 8)); setSeconds(signal.seconds); },
       (payload) => {
         setRecordingVoice(false); setLevel(0);
@@ -410,8 +512,14 @@ function PeopleView({ locale, onEnrollingChange }: { locale: Locale; onEnrolling
         if (payload.person) { setSelected(payload.person); setMessage({ text: copy.saved, kind: "success" }); }
         refresh();
       },
-    ).then((value) => { dispose = value; });
-    return () => dispose();
+    ).then((value) => {
+      if (cancelled) value();
+      else dispose = value;
+    });
+    return () => {
+      cancelled = true;
+      dispose();
+    };
   }, [copy.saved, refresh]);
 
   const choose = (person: Person | null) => {
@@ -513,6 +621,45 @@ function VoiceEnrollmentLava() {
       sizePercent={120}
     />
   );
+}
+
+function MeetingsView({ locale }: { locale: Locale }) {
+  const copy = identityCopy[locale];
+  const [meetings, setMeetings] = useState<MeetingSummary[]>([]);
+  const [selected, setSelected] = useState<MeetingSummary | null>(null);
+  const [items, setItems] = useState<SpeechResult[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!isTauri()) return;
+    listMeetingTranscripts().then((records) => { setMeetings(records); if (records[0]) setSelected(records[0]); }).catch((reason) => setError(String(reason)));
+  }, []);
+  useEffect(() => {
+    if (!selected) { setItems([]); return; }
+    loadMeetingTranscript(selected.output).then((records) => setItems(records.flatMap((record) => record.results))).catch((reason) => setError(String(reason)));
+  }, [selected]);
+  useEffect(() => {
+    let dispose: () => void = () => undefined;
+    let cancelled = false;
+    void subscribeToIdentityUpdates((update) => setItems((current) => applyIdentityUpdate(current, update))).then((unlisten) => {
+      if (cancelled) unlisten();
+      else dispose = unlisten;
+    });
+    return () => {
+      cancelled = true;
+      dispose();
+    };
+  }, []);
+  const date = (timestamp: number) => new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(timestamp));
+  return <section className="meeting-library glass-card">
+    <div className="meeting-index">
+      <div className="meeting-index-title"><strong>{copy.meetings}</strong><span>{meetings.length}</span></div>
+      {meetings.length ? <div className="meeting-index-list">{meetings.map((meeting) => <button className={selected?.id === meeting.id ? "is-selected" : ""} type="button" key={meeting.id} onClick={() => setSelected(meeting)}><span><UiIcon icon={CalendarCheck} size={16} /></span><span><strong>{date(meeting.createdAt)}</strong><small>{meeting.utterances} {copy.utterances} · {meeting.speakers} {copy.speakers}</small></span><UiIcon icon={ChevronRight} size={14} /></button>)}</div> : <div className="meeting-library-empty"><UiIcon icon={CalendarDays} size={24} /><p>{copy.empty}</p></div>}
+    </div>
+    <div className="meeting-review">
+      <div className="meeting-review-heading"><div><strong>{selected ? date(selected.createdAt) : copy.select}</strong>{selected ? <small>{selected.id}</small> : null}</div>{selected ? <span>{selected.speakers} {copy.speakers}</span> : null}</div>
+      {error ? <div className="transcript-error">{error}</div> : items.length ? <TranscriptList items={items} locale={locale} onChange={(update) => setItems((current) => applyIdentityUpdate(current, update))} /> : <div className="meeting-review-empty"><UiIcon icon={AudioLines} size={24} /><p>{copy.select}</p></div>}
+    </div>
+  </section>;
 }
 
 function CollectionView({ tab, t }: { tab: Exclude<Tab, "overview" | "settings">; t: (key: TranslationKey) => string }) {

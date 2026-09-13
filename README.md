@@ -1,36 +1,93 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# MeeTrack — Desktop Application
 
-## Getting Started
+> **Local-first Meeting Intelligence & Organizational Memory**  
+> Private, overlap-aware speech intelligence desktop app powered by **Tauri v2 + Next.js 15 + Rust Core**.
 
-First, run the development server:
+---
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+## 🌟 Overview
+
+**MeeTrack** transforms meetings into structured organizational memory with provenance. Unlike traditional cloud meeting note-takers, MeeTrack prioritizes **100% local-first privacy**, persistent voice identity across sessions, and advanced multi-speaker speech separation.
+
+- 🎙️ **Multi-source Audio Capture**: Record Microphone, System Audio, or specific running applications via Windows WASAPI loopback.
+- 👥 **Persistent Speaker Identity & Diarization**: Recognize known voices across sessions using voice embeddings and centroids, with unknown speaker workflows and retroactive linking.
+- 🔀 **Overlap-Aware Processing**: Detects overlapping speech and separates concurrent voices using SepFormer neural separation.
+- ⚡ **Real-time Responsive Interface**: Built with Next.js 15, React 19, TypeScript, Tailwind/CSS variables, and an audio-reactive Lava Lamp visualizer powered by Three.js shaders.
+- 🔒 **Local-first Privacy**: Continuous raw audio, embeddings, transcripts, and metadata remain on the user's local machine.
+
+---
+
+## 🏗️ Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Desktop UI (Next.js 15)                   │
+│    AppShell · AudioSourcePicker · People · WindowTitlebar   │
+│               Audio-Reactive Lava Lamp (Three.js)            │
+└──────────────────────────────┬──────────────────────────────┘
+                               │ Tauri IPC Events & Commands
+┌──────────────────────────────▼──────────────────────────────┐
+│                    Tauri Backend (Rust)                     │
+│    CoreManager · SpeakerIdentity · Enrollment · File Dialog │
+└──────────────────────────────┬──────────────────────────────┘
+                               │ Rust Crate Dependency
+┌──────────────────────────────▼──────────────────────────────┐
+│                Meeting Core Rust (core_rust)                │
+│    WASAPI Capture → Silero VAD → Overlap Detector           │
+│    → SepFormer Separation → Speaker ID → Zipformer STT      │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+---
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## 🚀 Tech Stack
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+- **Framework**: [Tauri v2](https://v2.tauri.app/)
+- **Frontend**: [Next.js 15 (App Router)](https://nextjs.org/), [React 19](https://react.dev/), [TypeScript](https://www.typescriptlang.org/)
+- **Styling & UI**: Custom Glassmorphism CSS, [Lucide Icons](https://lucide.dev/), Morphicons
+- **3D Graphics & Visualizer**: [Three.js](https://threejs.org/) raymarching shader
+- **Audio & ML Core**: Rust, ONNX Runtime (`ort`), Silero VAD, SepFormer, Hound WAV, Windows WASAPI loopback
 
-## Learn More
+---
 
-To learn more about Next.js, take a look at the following resources:
+## 🛠️ Getting Started
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+### Prerequisites
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+- [Node.js](https://nodejs.org/) (v20+ recommended, tested on v22)
+- [Rust](https://www.rust-lang.org/) (1.77.2+)
+- [FFmpeg](https://ffmpeg.org/) installed and available in system `PATH`
 
-## Deploy on Vercel
+### Installation
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```bash
+# Clone the repository
+git clone https://github.com/hoangvu1806/MeeTrack.git
+cd MeeTrack/application
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+# Install dependencies
+npm install
+```
+
+### Running in Development
+
+```bash
+# Run Desktop App (Next.js + Tauri native window)
+npm run tauri dev
+
+# Or run frontend only in browser (http://localhost:3000)
+npm run dev
+```
+
+### Building for Production
+
+```bash
+# Package as standalone desktop executable
+npm run tauri build
+```
+
+---
+
+## 📜 License
+
+Private / Proprietary — MeeTrack Team.
