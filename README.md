@@ -1,56 +1,56 @@
-# MeeTrack — Desktop Application
+# MeeTrack - Desktop Application
 
 > **Local-first Meeting Intelligence & Organizational Memory**  
-> Private, overlap-aware speech intelligence desktop app powered by **Tauri v2 + Next.js 15 + Rust Core**.
+> Private, overlap-aware speech intelligence desktop application built with **Tauri v2 + Next.js 15 + Rust Core**.
 
 ---
 
-## 🌟 Overview
+## Overview
 
 **MeeTrack** transforms meetings into structured organizational memory with provenance. Unlike traditional cloud meeting note-takers, MeeTrack prioritizes **100% local-first privacy**, persistent voice identity across sessions, and advanced multi-speaker speech separation.
 
-- 🎙️ **Multi-source Audio Capture**: Record Microphone, System Audio, or specific running applications via Windows WASAPI loopback.
-- 👥 **Persistent Speaker Identity & Diarization**: Recognize known voices across sessions using voice embeddings and centroids, with unknown speaker workflows and retroactive linking.
-- 🔀 **Overlap-Aware Processing**: Detects overlapping speech and separates concurrent voices using SepFormer neural separation.
-- ⚡ **Real-time Responsive Interface**: Built with Next.js 15, React 19, TypeScript, Tailwind/CSS variables, and an audio-reactive Lava Lamp visualizer powered by Three.js shaders.
-- 🔒 **Local-first Privacy**: Continuous raw audio, embeddings, transcripts, and metadata remain on the user's local machine.
+- **Multi-source Audio Capture**: Record Microphone, System Audio, or specific running applications via Windows WASAPI loopback.
+- **Persistent Speaker Identity & Diarization**: Recognize known voices across sessions using voice embeddings and centroids, with unknown speaker workflows and retroactive linking.
+- **Overlap-Aware Processing**: Detects overlapping speech and separates concurrent voices using SepFormer neural separation.
+- **Real-time Responsive Interface**: Built with Next.js 15, React 19, TypeScript, Tailwind/CSS variables, and an audio-reactive Lava Lamp visualizer powered by Three.js shaders.
+- **Local-first Privacy**: Continuous raw audio, embeddings, transcripts, and metadata remain on the user's local machine.
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Desktop UI (Next.js 15)                   │
-│    AppShell · AudioSourcePicker · People · WindowTitlebar   │
-│               Audio-Reactive Lava Lamp (Three.js)            │
-└──────────────────────────────┬──────────────────────────────┘
-                               │ Tauri IPC Events & Commands
-┌──────────────────────────────▼──────────────────────────────┐
-│                    Tauri Backend (Rust)                     │
-│    CoreManager · SpeakerIdentity · Enrollment · File Dialog │
-└──────────────────────────────┬──────────────────────────────┘
-                               │ Rust Crate Dependency
-┌──────────────────────────────▼──────────────────────────────┐
-│                Meeting Core Rust (core_rust)                │
-│    WASAPI Capture → Silero VAD → Overlap Detector           │
-│    → SepFormer Separation → Speaker ID → Zipformer STT      │
-└─────────────────────────────────────────────────────────────┘
++-------------------------------------------------------------+
+|                    Desktop UI (Next.js 15)                  |
+|    AppShell - AudioSourcePicker - People - WindowTitlebar   |
+|               Audio-Reactive Lava Lamp (Three.js)           |
++------------------------------+------------------------------+
+                               | Tauri IPC Events & Commands
++------------------------------v------------------------------+
+|                    Tauri Backend (Rust)                     |
+|    CoreManager - SpeakerIdentity - Enrollment - File Dialog |
++------------------------------+------------------------------+
+                               | Rust Crate Dependency
++------------------------------v------------------------------+
+|                Meeting Core Rust (core_rust)                |
+|    WASAPI Capture -> Silero VAD -> Overlap Detector         |
+|    -> SepFormer Separation -> Speaker ID -> Zipformer STT   |
++-------------------------------------------------------------+
 ```
 
 ---
 
-## 🚀 Tech Stack
+## Tech Stack
 
-- **Framework**: [Tauri v2](https://v2.tauri.app/)
+- **Desktop Framework**: [Tauri v2](https://v2.tauri.app/)
 - **Frontend**: [Next.js 15 (App Router)](https://nextjs.org/), [React 19](https://react.dev/), [TypeScript](https://www.typescriptlang.org/)
-- **Styling & UI**: Custom Glassmorphism CSS, [Lucide Icons](https://lucide.dev/), Morphicons
-- **3D Graphics & Visualizer**: [Three.js](https://threejs.org/) raymarching shader
+- **Styling & Components**: Glassmorphism CSS, Lucide Icons, Morphicons
+- **3D Graphics & Visualization**: [Three.js](https://threejs.org/) raymarching shader
 - **Audio & ML Core**: Rust, ONNX Runtime (`ort`), Silero VAD, SepFormer, Hound WAV, Windows WASAPI loopback
 
 ---
 
-## 🛠️ Getting Started
+## Getting Started
 
 ### Prerequisites
 
@@ -72,7 +72,7 @@ npm install
 ### Running in Development
 
 ```bash
-# Run Desktop App (Next.js + Tauri native window)
+# Run Desktop Application (Next.js + Tauri native window)
 npm run tauri dev
 
 # Or run frontend only in browser (http://localhost:3000)
@@ -88,6 +88,6 @@ npm run tauri build
 
 ---
 
-## 📜 License
+## License
 
-Private / Proprietary — MeeTrack Team.
+Private / Proprietary - MeeTrack Team.
